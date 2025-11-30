@@ -32,6 +32,26 @@ export function RoomScreen() {
     Alert.alert('Invite Copied!', inviteUrl)
   }, [inviteUrl])
 
+  const formatDate = useCallback((timestamp: number) => {
+    try {
+      if (!timestamp || isNaN(timestamp) || timestamp <= 0) {
+        return 'Invalid date'
+      }
+      return new Date(timestamp).toLocaleString()
+    } catch (e) {
+      console.error('Error formatting date:', e)
+      return 'Invalid date'
+    }
+  }, [])
+
+  const getMessageKey = useCallback((item: any, index: number) => {
+    // Use timestamp + index for unique key, fallback to index if timestamp is invalid
+    if (item.ts && typeof item.ts === 'number' && !isNaN(item.ts)) {
+      return `${item.ts}-${index}`
+    }
+    return `msg-${index}`
+  }, [])
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
@@ -55,7 +75,7 @@ export function RoomScreen() {
       <FlatList
         ref={flatListRef}
         data={messages}
-        keyExtractor={(_, i) => i.toString()}
+        keyExtractor={getMessageKey}
         style={styles.messages}
         contentContainerStyle={{ padding: 12 }}
         renderItem={({ item }) => (
@@ -65,10 +85,8 @@ export function RoomScreen() {
               item.me ? styles.myBubble : styles.theirBubble
             ]}
           >
-            <Text style={styles.bubbleText}>{item.text}</Text>
-            <Text style={styles.date}>
-              {new Date(item.ts).toLocaleString()}
-            </Text>
+            <Text style={styles.bubbleText}>{item.text || ''}</Text>
+            <Text style={styles.date}>{formatDate(item.ts)}</Text>
           </View>
         )}
       />
@@ -82,6 +100,8 @@ export function RoomScreen() {
           placeholderTextColor='#666'
           onSubmitEditing={handleSend}
           returnKeyType='send'
+          maxLength={10000}
+          multiline
         />
         <TouchableOpacity style={styles.sendButton} onPress={handleSend}>
           <Text style={styles.sendText}>Send</Text>

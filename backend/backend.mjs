@@ -27,6 +27,7 @@ async function initBackend() {
   let peerCores = new Map() // Map of peer cores (read-only)
   let swarm = null
   let currentRoom = null
+  const coreWatchIntervals = new Map() // Track watch intervals to prevent duplicates
 
   const { IPC } = BareKit
   const rpc = new RPC(IPC, onRequest)
@@ -56,12 +57,17 @@ async function initBackend() {
 
     if (req.command === RPC_SEND_MESSAGE) {
       if (myCore) {
-        const msg = JSON.parse(b4a.toString(req.data, 'utf8'))
-        msg.device_id = await getDeviceId()
-        msg.me = true
+        try {
+          const msg = JSON.parse(b4a.toString(req.data, 'utf8'))
+          const deviceId = await getDeviceId()
+          msg.device_id = deviceId
+          msg.me = true
 
-        await myCore.append(JSON.stringify(msg))
-        sendSystemMessage('Message appended to my core')
+          await myCore.append(JSON.stringify(msg))
+          sendSystemMessage('Message appended to my core')
+        } catch (e) {
+          sendSystemMessage('Error sending message: ' + e.message)
+        }
       }
     }
   }
@@ -88,6 +94,9 @@ async function initBackend() {
       return DEVICE_ID
     } catch (e) {
       sendSystemMessage('Error getting device ID: ' + e.message)
+      // Generate fallback ID if all else fails
+      DEVICE_ID = crypto.randomBytes(16).toString('hex')
+      return DEVICE_ID
     }
   }
 
@@ -123,15 +132,50 @@ async function initBackend() {
 
     peerCores.clear()
 
+    // Clear all watch intervals
+    for (const interval of coreWatchIntervals.values()) {
+      if (interval) {
+        clearInterval(interval)
+      }
+    }
+    coreWatchIntervals.clear()
+
     currentRoom = null
     sendSystemMessage('Left room successfully')
+  }
+
+  // Sanitize room name to prevent path traversal
+  function sanitizeRoomName(roomName) {
+    if (!roomName || typeof roomName !== 'string') {
+      return null
+    }
+    // Remove path traversal sequences and normalize
+    const sanitized = roomName
+      .replace(/\.\./g, '')
+      .replace(/[\/\\]/g, '-')
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .trim()
+    return sanitized.length > 0 && sanitized.length <= 64 ? sanitized : null
   }
 
   async function joinRoom(url) {
     await leaveRoom()
 
-    const parsedUrl = new URL(url)
-    currentRoom = parsedUrl.searchParams.get('room')
+    let parsedUrl
+    try {
+      parsedUrl = new URL(url)
+    } catch (e) {
+      sendSystemMessage('Error: Invalid URL format')
+      return
+    }
+
+    const rawRoom = parsedUrl.searchParams.get('room')
+    currentRoom = sanitizeRoomName(rawRoom)
+
+    if (!currentRoom) {
+      sendSystemMessage('Error: Invalid or missing room name')
+      return
+    }
 
     sendSystemMessage('Joining room: ' + currentRoom)
 
@@ -166,6 +210,14 @@ async function initBackend() {
       const peerId = b4a.toString(info.publicKey, 'hex')
       connectedPeers.add(peerId)
       sendSwarmCount()
+
+      if (!myCore) {
+        sendSystemMessage('Error: myCore is null, cannot handle connection')
+        conn.destroy()
+        return
+      }
+
+      let keySendTimeout = null
 
       conn.on('data', async (data) => {
         try {
@@ -212,7 +264,9 @@ async function initBackend() {
 
           // Watch for their messages
           watchCore(peerCore, false)
-        } catch (e) {}
+        } catch (e) {
+          sendSystemMessage('Error handling peer data: ' + e.message)
+        }
       })
 
       // Replicate MY writable core
@@ -220,15 +274,30 @@ async function initBackend() {
       sendSystemMessage('Started replicating my core')
 
       // Send my core key after a small delay to ensure listener is ready
-      setTimeout(() => {
-        conn.write(myCore.key)
-        sendSystemMessage('Sent my core key')
+      keySendTimeout = setTimeout(() => {
+        if (!conn.destroyed && myCore) {
+          try {
+            conn.write(myCore.key)
+            sendSystemMessage('Sent my core key')
+          } catch (e) {
+            sendSystemMessage('Error sending core key: ' + e.message)
+          }
+        }
+        keySendTimeout = null
       }, 100)
 
       conn.on('close', () => {
+        if (keySendTimeout) {
+          clearTimeout(keySendTimeout)
+          keySendTimeout = null
+        }
         connectedPeers.delete(peerId)
         sendSwarmCount()
         sendSystemMessage('Peer disconnected')
+      })
+
+      conn.on('error', (err) => {
+        sendSystemMessage('Connection error: ' + err.message)
       })
     })
 
@@ -243,6 +312,13 @@ async function initBackend() {
   }
 
   function watchCore(core, isMyCore) {
+    // Prevent watching the same core multiple times
+    const coreKey = core.key ? b4a.toString(core.key, 'hex') : 'unknown'
+    if (coreWatchIntervals.has(coreKey)) {
+      sendSystemMessage('Already watching this core, skipping duplicate watch')
+      return
+    }
+
     // Send only existing messages
     let lastIndex = 0
     let syncInterval = null
@@ -261,17 +337,29 @@ async function initBackend() {
 
           const newMessages = []
           for (let i = lastIndex; i < currentLength; i++) {
-            const entry = await core.get(i)
-            const msg = JSON.parse(entry)
-            newMessages.push({ ...msg, me: DEVICE_ID === msg.device_id })
+            try {
+              const entry = await core.get(i)
+              const msg = JSON.parse(entry)
+              const deviceId = DEVICE_ID || (await getDeviceId())
+              newMessages.push({ ...msg, me: deviceId === msg.device_id })
+            } catch (e) {
+              sendSystemMessage(
+                `Error parsing message at index ${i}: ${e.message}`
+              )
+              // Continue processing other messages
+            }
           }
 
           // Sort by timestamp before sending
-          newMessages.sort((a, b) => a.ts - b.ts)
+          newMessages.sort((a, b) => (a.ts || 0) - (b.ts || 0))
 
           for (const msg of newMessages) {
-            const rpcMsg = rpc.request(RPC_NEW_MESSAGE)
-            rpcMsg.send(b4a.from(JSON.stringify(msg)))
+            try {
+              const rpcMsg = rpc.request(RPC_NEW_MESSAGE)
+              rpcMsg.send(b4a.from(JSON.stringify(msg)))
+            } catch (e) {
+              sendSystemMessage('Error sending message: ' + e.message)
+            }
           }
 
           lastIndex = currentLength
@@ -289,11 +377,15 @@ async function initBackend() {
       checkMessages()
     }, 2000)
 
+    // Track the interval
+    coreWatchIntervals.set(coreKey, syncInterval)
+
     // Clean up interval when core closes
     core.on('close', () => {
       if (syncInterval) {
         clearInterval(syncInterval)
         syncInterval = null
+        coreWatchIntervals.delete(coreKey)
         sendSystemMessage(
           `Stopped sync interval for ${isMyCore ? 'my' : 'peer'} core`
         )

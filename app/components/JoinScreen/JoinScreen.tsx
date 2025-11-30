@@ -36,6 +36,7 @@ export function JoinScreen() {
         placeholder='e.g. secret-party-2025'
         autoCapitalize='none'
         autoCorrect={false}
+        maxLength={64}
       />
 
       <TouchableOpacity
